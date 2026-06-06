@@ -1,0 +1,363 @@
+# =========================================================================
+# ANÁLISE DE SENSIBILIDADE DOS PESOS - AHP GAUSSIANO
+# MODELOS: MOVIMENTOS DE MASSA E INUNDAÇÕES
+# =========================================================================
+# Baseado na metodologia do manuscrito (seção 4.6)
+# Autor: (seu nome)
+# Data: 2026
+# =========================================================================
+
+# PACOTES NECESSÁRIOS ------------------------------------------------------
+library(terra)
+library(ggplot2)
+library(reshape2)
+
+# -------------------------------------------------------------------------
+# 0. CONFIGURAÇÕES GERAIS
+# -------------------------------------------------------------------------
+
+# Caminho da pasta onde estão os rasters (ajuste conforme necessário)
+pasta_rasters <- "C:/Usuario/Seu_User/Pasta"  # <-- ALTERAR
+
+# Lista de fatores para cada modelo (deve corresponder aos nomes dos arquivos .tif)
+# Para MOVIMENTOS DE MASSA
+fatores_mm <- c(
+  "Declividade",
+  "Curvatura_Gaussiana",
+  "Distancia_vias",
+  "Geomorfologia",
+  "Litologia_Geologia",
+  "Uso_e_Cobertura",
+  "Relevo",
+  "TRI",
+  "TWI"
+)
+
+# Para INUNDAÇÕES
+fatores_inund <- c(
+  "Altimetria",
+  "Densidade_drenagem",
+  "Geomorfologia",
+  "HAND",
+  "Uso_e_Cobertura",
+  "Distancia_drenagem",
+  "TWI"
+)
+
+# Nomes das variáveis que devem ter relação inversa com o perigo
+# (menor valor = maior perigo) -> serão invertidas na normalização
+inverter_mm <- c()  # normalmente nenhum para MM, mas se houver, adicione
+inverter_inund <- c("Altimetria", "HAND", "Distancia_drenagem")
+
+# Fatores categóricos (usam reamostragem "near")
+categoricos <- c("Geomorfologia", "Litologia_Geologia", "Uso_e_Cobertura")
+
+# Limiares para classificação (fixos, conforme manuscrito)
+quebras <- c(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+rotulos <- c("Muito Baixo", "Baixo", "Médio", "Alto", "Muito Alto")
+
+# Fatores a serem testados na análise de sensibilidade (os mais influentes)
+# Para MM: Curvatura, Declividade, TRI (exemplo; pode ajustar)
+sensibilidade_mm_fatores <- c("Curvatura_Gaussiana", "Declividade", "TRI")
+# Para inundações: Altimetria, HAND, Uso_e_Cobertura
+sensibilidade_inund_fatores <- c("Altimetria", "HAND", "Uso_e_Cobertura")
+
+# Variações percentuais a aplicar nos pesos
+deltas <- c(-0.2, -0.1, 0.1, 0.2)
+
+# -------------------------------------------------------------------------
+# 1. FUNÇÕES AUXILIARES
+# -------------------------------------------------------------------------
+
+#' Alinha um raster a um raster de referência
+#' @param r raster a ser alinhado
+#' @param nome nome do raster (para identificar se é categórico)
+#' @param ref raster de referência
+#' @return raster alinhado
+alinhar_raster <- function(r, nome, ref) {
+  if (compareGeom(r, ref, stopOnError = FALSE, res = TRUE, ext = TRUE, crs = TRUE)) {
+    cat("  ", nome, "já está alinhado.\n")
+    return(r)
+  }
+  metodo <- if (nome %in% categoricos) "near" else "bilinear"
+  cat("  ", nome, "-> reprojetado/reamostrado com método", metodo, "\n")
+  r_align <- project(r, ref, method = metodo)
+  return(r_align)
+}
+
+#' Normalização linear para [0,1] com opção de inversão
+#' @param r raster
+#' @param inverter se TRUE, faz 1 - valor normalizado
+#' @return raster normalizado
+normalizar <- function(r, inverter = FALSE) {
+  min_r <- global(r, "min", na.rm = TRUE)[1,1]
+  max_r <- global(r, "max", na.rm = TRUE)[1,1]
+  r_norm <- (r - min_r) / (max_r - min_r)
+  if (inverter) r_norm <- 1 - r_norm
+  return(r_norm)
+}
+
+#' Função de pertinência Fuzzy Gaussiana (equação 1 do manuscrito)
+#' @param r raster já normalizado [0,1]
+#' @return raster com valores fuzzy gaussianos
+fuzzy_gauss <- function(r) {
+  vals <- values(r, mat = FALSE)
+  vals <- vals[!is.na(vals)]
+  mu <- mean(vals)
+  sigma <- sd(vals)
+  if (sigma == 0) return(r)  # evitar divisão por zero
+  g <- exp(-((r - mu)^2) / (2 * sigma^2))
+  return(g)
+}
+
+#' Calcula o Fator Gaussiano (sigma/mu) para um raster fuzzy
+#' @param r raster (após fuzzy)
+#' @return valor numérico do fator
+fator_gaussiano <- function(r) {
+  vals <- values(r, mat = FALSE)
+  vals <- vals[!is.na(vals)]
+  if (length(vals) == 0) return(0)
+  mu <- mean(vals)
+  if (mu == 0) return(0)
+  sigma <- sd(vals)
+  return(sigma / mu)
+}
+
+#' Processa um conjunto de rasters: alinha, normaliza, aplica fuzzy,
+#' calcula pesos base e retorna lista com rasters fuzzy e pesos.
+#' @param pasta caminho da pasta com arquivos .tif
+#' @param fatores vetor com nomes dos arquivos (sem extensão)
+#' @param inverter vetor com nomes dos fatores que devem ser invertidos
+#' @return lista com elementos: rasters_fuzzy (lista de SpatRaster),
+#'         pesos_base (vetor nomeado), tabela_pesos (data.frame)
+processar_modelo <- function(pasta, fatores, inverter = c()) {
+  cat("\n========================================\n")
+  cat("Processando modelo:", deparse(substitute(pasta)), "\n")
+  cat("========================================\n")
+  
+  # Listar arquivos .tif que correspondem aos fatores
+  arquivos <- list.files(pasta, pattern = "\\.tif$", full.names = TRUE)
+  nomes_arquivos <- tools::file_path_sans_ext(basename(arquivos))
+  idx <- which(nomes_arquivos %in% fatores)
+  if (length(idx) != length(fatores)) {
+    missing <- setdiff(fatores, nomes_arquivos[idx])
+    stop("Fatores não encontrados: ", paste(missing, collapse = ", "))
+  }
+  arquivos <- arquivos[idx]
+  fatores <- nomes_arquivos[idx]  # garante ordem correta
+  
+  # Carregar rasters (primeira banda)
+  rasters <- lapply(arquivos, function(x) rast(x)[[1]])
+  names(rasters) <- fatores
+  
+  # Definir raster de referência (primeiro da lista)
+  ref <- rasters[[1]]
+  
+  # Alinhar todos
+  cat("\n--- Alinhamento ---\n")
+  rasters_align <- list()
+  for (i in seq_along(rasters)) {
+    rasters_align[[i]] <- alinhar_raster(rasters[[i]], fatores[i], ref)
+  }
+  names(rasters_align) <- fatores
+  
+  # Normalizar (com inversão se necessário)
+  cat("\n--- Normalização ---\n")
+  for (i in seq_along(rasters_align)) {
+    invert <- fatores[i] %in% inverter
+    cat(" ", fatores[i], if(invert) "(invertido)" else "(normal)", "\n")
+    rasters_align[[i]] <- normalizar(rasters_align[[i]], inverter = invert)
+  }
+  
+  # Aplicar Fuzzy Gaussiana
+  cat("\n--- Fuzzy Gaussiana ---\n")
+  rasters_fuzzy <- list()
+  for (i in seq_along(rasters_align)) {
+    cat("  Aplicando fuzzy em", fatores[i], "\n")
+    rasters_fuzzy[[i]] <- fuzzy_gauss(rasters_align[[i]])
+  }
+  names(rasters_fuzzy) <- fatores
+  
+  # Calcular pesos base (AHP Gaussiano)
+  cat("\n--- Cálculo dos pesos base ---\n")
+  fatores_gauss <- sapply(rasters_fuzzy, fator_gaussiano)
+  pesos_base <- fatores_gauss / sum(fatores_gauss)
+  names(pesos_base) <- fatores
+  
+  tabela_pesos <- data.frame(
+    Variavel = fatores,
+    Fator_Gaussiano = round(fatores_gauss, 6),
+    Peso_Gaussiano = round(pesos_base, 4)
+  )
+  print(tabela_pesos)
+  
+  return(list(
+    rasters_fuzzy = rasters_fuzzy,
+    pesos_base = pesos_base,
+    tabela_pesos = tabela_pesos
+  ))
+}
+
+#' Calcula o índice de perigo por combinação linear ponderada
+#' @param rasters_fuzzy lista de rasters fuzzy (SpatRaster)
+#' @param pesos vetor de pesos (mesmo comprimento e ordem)
+#' @return raster contínuo com índice de perigo (normalizado [0,1])
+calcular_perigo <- function(rasters_fuzzy, pesos) {
+  # Inicializa com zeros
+  r_perigo <- rast(rasters_fuzzy[[1]])
+  values(r_perigo) <- 0
+  for (i in seq_along(rasters_fuzzy)) {
+    r_perigo <- r_perigo + (rasters_fuzzy[[i]] * pesos[i])
+  }
+  # Normalização final para [0,1]
+  min_r <- global(r_perigo, "min", na.rm = TRUE)[1,1]
+  max_r <- global(r_perigo, "max", na.rm = TRUE)[1,1]
+  r_perigo <- (r_perigo - min_r) / (max_r - min_r)
+  return(r_perigo)
+}
+
+#' Classifica o raster contínuo em níveis usando limiares fixos
+#' @param r raster contínuo [0,1]
+#' @param quebras vetor de limites (ex: c(0,0.2,0.4,0.6,0.8,1))
+#' @return raster categórico (valores 1..5)
+classificar_perigo <- function(r, quebras) {
+  classify(r, matrix(quebras, ncol = 3, byrow = TRUE))
+}
+
+#' Calcula a área crítica (pixels nas classes Alto e Muito Alto)
+#' @param r_class raster classificado (valores 1..5)
+#' @return número de pixels com classe >= 4
+area_critica <- function(r_class) {
+  freq <- freq(r_class)
+  # freq: coluna value e count
+  alto_muito <- freq[freq[,1] >= 4, "count"]
+  if (length(alto_muito) == 0) return(0)
+  return(sum(alto_muito))
+}
+
+#' Executa análise de sensibilidade para um modelo
+#' @param modelo lista retornada por processar_modelo()
+#' @param fatores_teste vetor com nomes dos fatores a variar
+#' @param deltas vetor com as variações relativas (ex: c(-0.2, -0.1, 0.1, 0.2))
+#' @return lista com resultados: tabela_sensibilidade, plots, etc.
+analise_sensibilidade <- function(modelo, fatores_teste, deltas) {
+  rasters_fuzzy <- modelo$rasters_fuzzy
+  pesos_base <- modelo$pesos_base
+  fatores <- names(pesos_base)
+  
+  # Índice de perigo base
+  perigo_base <- calcular_perigo(rasters_fuzzy, pesos_base)
+  class_base <- classificar_perigo(perigo_base, quebras)
+  area_base <- area_critica(class_base)
+  
+  cat("\n--- Área crítica base (pixels):", area_base, "---\n")
+  
+  # Estrutura para armazenar resultados
+  resultados <- data.frame(
+    Fator = character(),
+    Delta = numeric(),
+    Area_critica = integer(),
+    Variacao_percentual = numeric()
+  )
+  
+  for (fator in fatores_teste) {
+    if (!(fator %in% fatores)) {
+      warning("Fator ", fator, " não encontrado no modelo. Pulando.")
+      next
+    }
+    idx <- which(fatores == fator)
+    peso_original <- pesos_base[idx]
+    
+    for (delta in deltas) {
+      novo_peso <- peso_original * (1 + delta)
+      # Criar novo vetor de pesos
+      pesos_novo <- pesos_base
+      pesos_novo[idx] <- novo_peso
+      # Renormalizar para soma = 1
+      pesos_novo <- pesos_novo / sum(pesos_novo)
+      
+      # Calcular novo índice de perigo
+      perigo_novo <- calcular_perigo(rasters_fuzzy, pesos_novo)
+      class_novo <- classificar_perigo(perigo_novo, quebras)
+      area_nova <- area_critica(class_novo)
+      
+      variacao <- (area_nova - area_base) / area_base * 100
+      
+      resultados <- rbind(resultados, data.frame(
+        Fator = fator,
+        Delta = delta,
+        Area_critica = area_nova,
+        Variacao_percentual = round(variacao, 2)
+      ))
+      
+      cat(sprintf("  %s: delta = %+4.1f  -> área crítica = %d (variação = %+6.2f%%)\n",
+                  fator, delta, area_nova, variacao))
+    }
+  }
+  
+  # Gráfico de barras
+  p <- ggplot(resultados, aes(x = factor(Delta), y = Variacao_percentual, fill = Fator)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title = "Análise de Sensibilidade dos Pesos",
+         x = "Variação relativa do peso", y = "Variação da área crítica (%)") +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set1")
+  
+  print(p)
+  
+  return(list(
+    resultados = resultados,
+    area_base = area_base,
+    grafico = p
+  ))
+}
+
+# -------------------------------------------------------------------------
+# 2. EXECUÇÃO PARA O MODELO DE MOVIMENTOS DE MASSA
+# -------------------------------------------------------------------------
+
+cat("\n\n========== MODELO: MOVIMENTOS DE MASSA ==========\n")
+modelo_mm <- processar_modelo(pasta_rasters, fatores_mm, inverter_mm)
+sens_mm <- analise_sensibilidade(modelo_mm, sensibilidade_mm_fatores, deltas)
+
+# Salvar tabela de sensibilidade (MM)
+write.csv(sens_mm$resultados, "sensibilidade_movimentos_massa.csv", row.names = FALSE)
+# Não se esqueça que para salvar tem que ter o caminho da pasta "C:/Usuario/Seu_User/Pasta"
+
+# -------------------------------------------------------------------------
+# 3. EXECUÇÃO PARA O MODELO DE INUNDAÇÕES
+# -------------------------------------------------------------------------
+
+cat("\n\n========== MODELO: INUNDAÇÕES ==========\n")
+modelo_inund <- processar_modelo(pasta_rasters, fatores_inund, inverter_inund)
+sens_inund <- analise_sensibilidade(modelo_inund, sensibilidade_inund_fatores, deltas)
+
+# Salvar tabela de sensibilidade (inundações)
+write.csv(sens_inund$resultados, "sensibilidade_inundacoes.csv", row.names = FALSE)
+# Não se esqueça que para salvar tem que ter o caminho da pasta "C:/Usuario/Seu_User/Pasta"
+
+# -------------------------------------------------------------------------
+# 4. (OPCIONAL) COMPARAÇÃO COM PESOS DO MANUSCRITO
+# -------------------------------------------------------------------------
+# Caso queira usar os pesos da Tabela 7 e 8 do manuscrito em vez de recalcular,
+# descomente e adapte o bloco abaixo.
+
+# pesos_manuscrito_mm <- c(
+#   Declividade = 0.11478,
+#   Curvatura_Gaussiana = 0.42670,
+#   Distancia_vias = 0.08297,
+#   Geomorfologia = 0.06784,
+#   Litologia_Geologia = 0.03123,
+#   Uso_e_Cobertura = 0.04265,
+#   Relevo = 0.09724,
+#   TRI = 0.08885,
+#   TWI = 0.00019
+# )
+# 
+# # Verificar ordem e aplicar ...
+# 
+# -------------------------------------------------------------------------
+# FIM
+# -------------------------------------------------------------------------
+cat("\nAnálise de sensibilidade concluída com sucesso!\n")
