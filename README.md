@@ -1,5 +1,6 @@
 # Analise AHP Gaussiana
 Scripts na linguagem R baseadas no trabalho de Marques-Carvalho et al. (2025).
+Scripts na linguagem Python no Jupyter Notebook baseados no Vídeo de Pablo Santos (2021). <Disponível em: https://youtu.be/_qFpMwlvs9U?si=YA4jeMnfEiNU72xl>
 Trabalho feito como parte da disciplina IA243 - Trabalho de Graduação, do curso de Geologia da Universidade Federal Rural do Rio de Janeiro
 com intuito de obter o título de bacharel em Geologia.
 Repositório público para avaliação dos métodos utilizados e possibilidade de reprodutibilidade do método adotado no trabalho apresentado.
